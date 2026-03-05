@@ -30,6 +30,10 @@ struct Args {
 
     #[arg(long, short)]
     verbose: bool,
+
+    /// Analyze existing code instead of reviewing changes
+    #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "")]
+    analyze: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -49,7 +53,7 @@ provider = "anthropic"
 
 [[reviewer]]
 name = "gemini"
-model = "gemini-3-flash-previewå"
+model = "gemini-3-flash-preview"
 provider = "gemini"
 auth = "oauth"
 "#;
@@ -107,20 +111,79 @@ async fn main() -> Result<()> {
         eyre::bail!("--repo must point to a git repository (missing .git)");
     }
 
-    let config_path = args.config.unwrap_or_else(|| repo.join("nitpicker.toml"));
-    let config_str = std::fs::read_to_string(&config_path)
-        .map_err(|e| eyre::eyre!("failed to read config {:?}: {e}", config_path))?;
-    let config: config::Config =
-        toml::from_str(&config_str).map_err(|e| eyre::eyre!("invalid config: {e}"))?;
+    let config = load_config(args.config.as_deref(), &repo)?;
 
-    let prompt = match args.prompt {
-        Some(p) => p,
-        None => detect_diff_context(&repo)?,
+    let prompt = if let Some(path) = args.analyze {
+        // Empty string means analyze entire repo (from default_missing_value)
+        let path_opt = if path.as_os_str().is_empty() {
+            None
+        } else {
+            Some(path.as_path())
+        };
+        build_analysis_prompt(path_opt, args.prompt.as_deref())
+    } else {
+        match args.prompt {
+            Some(p) => p,
+            None => detect_diff_context(&repo)?,
+        }
     };
 
     let report = review::run_review(&repo, &prompt, &config, args.verbose).await?;
     println!("{report}");
     Ok(())
+}
+
+fn load_config(explicit_path: Option<&Path>, repo: &Path) -> Result<config::Config> {
+    // 1. explicit --config flag
+    if let Some(path) = explicit_path {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| eyre::eyre!("failed to read config {:?}: {e}", path))?;
+        return toml::from_str(&content).map_err(|e| eyre::eyre!("invalid config: {e}"));
+    }
+
+    // 2. repo-level nitpicker.toml
+    let repo_config = repo.join("nitpicker.toml");
+    if repo_config.exists() {
+        let content = std::fs::read_to_string(&repo_config)
+            .map_err(|e| eyre::eyre!("failed to read config {:?}: {e}", repo_config))?;
+        return toml::from_str(&content).map_err(|e| eyre::eyre!("invalid config: {e}"));
+    }
+
+    // 3. global config: ~/.nitpicker/config.toml (same dir as oauth token)
+    if let Some(home) = dirs::home_dir() {
+        let global_config = home.join(".nitpicker").join("config.toml");
+        if global_config.exists() {
+            let content = std::fs::read_to_string(&global_config)
+                .map_err(|e| eyre::eyre!("failed to read config {:?}: {e}", global_config))?;
+            return toml::from_str(&content).map_err(|e| eyre::eyre!("invalid config: {e}"));
+        }
+    }
+
+    eyre::bail!(
+        "no config found. create one with:\n  \
+         nitpicker init\n\n\
+         or at global location:\n  \
+         ~/.nitpicker/config.toml"
+    )
+}
+
+fn build_analysis_prompt(path: Option<&Path>, custom_prompt: Option<&str>) -> String {
+    let target = match path {
+        Some(p) => format!("`{}`", p.display()),
+        None => "the entire repository".to_string(),
+    };
+    let base = format!(
+        "Analyze the following code for issues and improvement opportunities:\n\
+         - Target: {}\n\
+         - Focus: correctness, security, performance, maintainability",
+        target
+    );
+    match custom_prompt {
+        Some(p) if !p.trim().is_empty() => {
+            format!("{}\n\nAdditional instructions: {}", base, p)
+        }
+        _ => base,
+    }
 }
 
 fn detect_diff_context(repo: &Path) -> Result<String> {

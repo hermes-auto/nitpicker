@@ -27,11 +27,27 @@ nitpicker --repo /path/to/repo
 
 # customized prompt
 nitpicker --repo /path/to/repo --prompt "Review only src/api/"
+
+# analyze existing code (no PR/diff required)
+nitpicker --analyze src/components/
+nitpicker --analyze src/main.rs
+nitpicker --analyze  # analyze entire repo
 ```
 
 ## Configuration
 
-Place `nitpicker.toml` at the root of the repo being reviewed, or pass `--config /path/to/file.toml`.
+Configuration is loaded from (first match wins):
+
+1. `--config <path>` (explicit flag)
+2. `nitpicker.toml` in repo root
+3. `~/.nitpicker/config.toml` (global config)
+
+```bash
+# create a config in current directory
+nitpicker init
+```
+
+Example `nitpicker.toml`:
 
 ```toml
 [aggregator]
@@ -92,7 +108,8 @@ This opens a browser, completes the OAuth flow, and saves the token to `~/.nitpi
 
 ```
 --repo <PATH>      git repository to review [default: .]
---config <PATH>    config file [default: <repo>/nitpicker.toml]
+--config <PATH>    config file [default: <repo>/nitpicker.toml, then ~/.nitpicker/config.toml]
 --prompt <TEXT>    review instructions (optional, has a sensible default)
+--analyze [PATH]   analyze existing code instead of reviewing changes
 --gemini-oauth     run Gemini OAuth authentication flow and exit
 ```

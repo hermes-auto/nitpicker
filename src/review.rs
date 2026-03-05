@@ -69,7 +69,7 @@ pub async fn run_review(
             let start = Instant::now();
             let result = run_agent(
                 config,
-                "Begin your review. Start with the changes specified in your instructions, then explore surrounding context as needed.",
+                "Begin your review. Start with the changes or target path specified in your instructions, then explore surrounding context as needed.",
                 &tools_map,
                 &repo,
             )
@@ -106,15 +106,15 @@ pub async fn run_review(
     let combined = rendered.join("\n\n---\n\n");
     let reduce_prompt = format!(
         "Your job is to synthesize multiple code reviews into a single,\n\
-actionable summary. Deduplicate findings, resolve conflicts, and prioritize by severity.\n\n\
-Format your response as:\n\
-1. **Critical** - must fix before merge\n\
-2. **Important** - should fix, but not blocking\n\
-3. **Suggestions** - nice to have improvements\n\n\
-If there are no findings in a category, omit it.\n\n\
-Start your response with a one-sentence overall verdict on whether the code is ready to merge or not (must start with APPROVE or REJECT). Markdown is not supported. \n\n\
-Individual reviews:\n\n\
-{combined}"
+        actionable summary. Deduplicate findings, resolve conflicts, and prioritize by severity. Include source of every item (refer reviewers).\n\n\
+        Format your response as:\n\
+        1. **Critical** - must fix before merge\n\
+        2. **Important** - should fix, but not blocking\n\
+        3. **Suggestions** - nice to have improvements\n\n\
+        If there are no findings in a category, omit it.\n\n\
+        Start your response with a one-sentence overall verdict on whether the code is ready to merge or not (must start with APPROVE or REJECT). Markdown is not supported. \n\n\
+        Individual reviews:\n\n\
+        {combined}"
     );
 
     let pb_agg = mp.add(ProgressBar::new_spinner());
@@ -154,21 +154,21 @@ fn build_system_prompt(user_prompt: &str) -> String {
 
     format!(
         "You are a code reviewer. Use the available tools (git, read_file, glob, grep) \
-to explore the repository and understand the changes.\n\
-\n\
-Review criteria:\n\
-- Correctness: logic bugs, edge cases, off-by-one errors\n\
-- Security: injection, auth issues, secrets in code, unsafe deserialization (only flag a security issue if you can trace a concrete exploit path, not just recognize a pattern)\n\
-- Performance: unnecessary allocations, N+1 queries, blocking calls in async context\n\
-- ML rigor: data leakage, incorrect loss/metrics, numerical instability, non-reproducibility\n\
-- Maintainability: dead code, copy-paste, unused variables, missing error handling\n\
-\n\
-Style: fail loudly, not silently. No swallowed exceptions, no magic fallbacks, \
-no unexplained constants. Anything that can go wrong at runtime must be explicitly \
-checked and logged.\n\
-\n\
-Be concise. Skip nitpicks and purely stylistic issues. Do not suggest speculative improvements.\n\
-Do not modify the repository. If you need scratch space, use /tmp.{user_instructions}"
+        to explore the repository and understand the changes.\n\
+        \n\
+        Review criteria:\n\
+        - Correctness: logic bugs, edge cases, off-by-one errors\n\
+        - Security: injection, auth issues, secrets in code, unsafe deserialization (only flag a security issue if you can trace a concrete exploit path, not just recognize a pattern)\n\
+        - Performance: unnecessary allocations, N+1 queries, blocking calls in async context\n\
+        - ML rigor: data leakage, incorrect loss/metrics, numerical instability, non-reproducibility\n\
+        - Maintainability: dead code, copy-paste, unused variables, missing error handling\n\
+        \n\
+        Style: fail loudly, not silently. No swallowed exceptions, no magic fallbacks, \
+        no unexplained constants. Anything that can go wrong at runtime must be explicitly \
+        checked and logged.\n\
+        \n\
+        Be concise. Skip nitpicks and purely stylistic issues. Do not suggest speculative improvements.\n\
+        Do not modify the repository. If you need scratch space, use /tmp.{user_instructions}"
     )
 }
 
