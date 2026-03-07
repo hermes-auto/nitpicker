@@ -5,6 +5,7 @@ use tracing_subscriber::EnvFilter;
 
 mod agent;
 mod config;
+mod debate;
 mod gemini_proxy;
 mod llm;
 mod review;
@@ -40,6 +41,15 @@ struct Args {
 enum Command {
     /// Generate a nitpicker.toml template in the current directory
     Init,
+    /// Two LLM agents debate a topic about the codebase
+    Debate {
+        /// Topic or question to debate
+        #[arg(long)]
+        prompt: String,
+        /// Maximum number of debate rounds
+        #[arg(long, default_value = "5")]
+        rounds: usize,
+    },
 }
 
 const INIT_TEMPLATE: &str = r#"[aggregator]
@@ -77,14 +87,25 @@ async fn main() -> Result<()> {
         .compact()
         .init();
 
-    if let Some(Command::Init) = args.command {
-        let path = Path::new("nitpicker.toml");
-        if path.exists() {
-            eyre::bail!("nitpicker.toml already exists");
+    match args.command {
+        Some(Command::Init) => {
+            let path = Path::new("nitpicker.toml");
+            if path.exists() {
+                eyre::bail!("nitpicker.toml already exists");
+            }
+            std::fs::write(path, INIT_TEMPLATE)?;
+            println!("Created nitpicker.toml");
+            return Ok(());
         }
-        std::fs::write(path, INIT_TEMPLATE)?;
-        println!("Created nitpicker.toml");
-        return Ok(());
+        Some(Command::Debate { prompt, rounds }) => {
+            let repo = args.repo.canonicalize()?;
+            if !repo.join(".git").is_dir() {
+                eyre::bail!("--repo must point to a git repository (missing .git)");
+            }
+            let config = load_config(args.config.as_deref(), &repo)?;
+            return debate::run_debate(&repo, &prompt, &config, rounds, args.verbose).await;
+        }
+        None => {}
     }
 
     // Handle OAuth login if requested (before validating repo or config)

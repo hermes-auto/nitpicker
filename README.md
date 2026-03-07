@@ -32,6 +32,10 @@ nitpicker --repo /path/to/repo --prompt "Review only src/api/"
 nitpicker --analyze src/components/
 nitpicker --analyze src/main.rs
 nitpicker --analyze  # analyze entire repo
+
+# two LLM agents debate a topic about the codebase (requires ≥2 reviewers in config)
+nitpicker debate --prompt "should we use eyre or thiserror for error handling?"
+nitpicker debate --prompt "is this authentication flow secure?" --rounds 3
 ```
 
 ## Configuration
@@ -112,4 +116,19 @@ This opens a browser, completes the OAuth flow, and saves the token to `~/.nitpi
 --prompt <TEXT>    review instructions (optional, has a sensible default)
 --analyze [PATH]   analyze existing code instead of reviewing changes
 --gemini-oauth     run Gemini OAuth authentication flow and exit
+-v, --verbose      show info-level logs (hidden by default)
 ```
+
+### Debate subcommand
+
+```
+nitpicker debate --prompt <TEXT> [--repo .] [--config PATH] [--rounds 5] [-v]
+```
+
+Two LLM agents — Actor and Critic — take turns exploring the codebase with file/git tools and submitting verdicts. The Critic can signal agreement (`agree=true`) to end the debate early. A meta-reviewer then synthesizes the dialogue into a conclusion.
+
+- `reviewer[0]` in config → Actor
+- `reviewer[1]` in config → Critic
+- `aggregator` → Meta-reviewer
+
+Transcript saved to `{tempdir}/debate-{timestamp}.md`.

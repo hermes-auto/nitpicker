@@ -15,6 +15,9 @@ cargo run -- --repo . --analyze src/db/
 # Custom focus
 cargo run -- --repo . --prompt "focus on SQL injection"
 
+# Debate mode (requires ≥2 reviewers in config)
+cargo run -- debate --prompt "should we use eyre or thiserror?"
+
 # Gemini OAuth (first-time setup)
 cargo run -- --gemini-oauth
 ```
@@ -25,18 +28,27 @@ cargo run -- --gemini-oauth
 main.rs         CLI, config loading, wires everything together
 config.rs       TOML config deserialization (Config, ReviewerConfig, AggregatorConfig)
 review.rs       orchestrates parallel reviewers → aggregation
+debate.rs       sequential actor/critic debate loop → meta-review
 agent.rs        agentic tool-use loop for a single reviewer
 llm.rs          LLM client trait, per-provider impls, retry wrapper
 tools.rs        tool definitions: read_file, glob, grep, git
 gemini_proxy/   local HTTP proxy that translates Gemini API calls to Google Code Assist
 ```
 
-### Request flow
+### Review flow
 
 1. `review.rs` spawns one `tokio::task` per `[[reviewer]]` in config
 2. Each task runs `agent.rs::run_agent` — an agentic loop: call LLM → execute tool calls → feed results back → repeat until the model returns text (max 100 turns)
 3. All reviewer outputs are collected, concatenated, and sent to the aggregator model in a single completion call
 4. The aggregator's response is printed to stdout
+
+### Debate flow (`nitpicker debate`)
+
+1. `reviewer[0]` = Actor, `reviewer[1]` = Critic, `aggregator` = Meta-reviewer
+2. Each round: Actor turn → Critic turn. Both have access to all file/git tools plus `submit_verdict(verdict, agree)`
+3. `agree=true` from Critic → convergence, loop ends early
+4. After all rounds: meta-reviewer synthesizes the full dialogue in a single non-agentic completion
+5. Transcript saved to `debate-{ts}.md`
 
 ### LLM abstraction (`llm.rs`)
 
