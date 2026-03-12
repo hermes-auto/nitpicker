@@ -3,8 +3,15 @@ use serde::Deserialize;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    pub defaults: Option<DefaultsConfig>,
     pub aggregator: AggregatorConfig,
     pub reviewer: Vec<ReviewerConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DefaultsConfig {
+    pub debate: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -60,5 +67,14 @@ impl ReviewerConfig {
     /// Returns true if OAuth should be used for authentication
     pub fn use_oauth(&self) -> bool {
         self.auth.as_ref().map(|a| a == "oauth").unwrap_or(false)
+    }
+}
+
+impl Config {
+    pub fn default_debate(&self) -> bool {
+        self.defaults
+            .as_ref()
+            .and_then(|defaults| defaults.debate)
+            .unwrap_or(false)
     }
 }
