@@ -34,7 +34,10 @@ struct Args {
     #[command(flatten)]
     common: CommonArgs,
 
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Additional review instructions appended to the diff context (use `ask` for fully custom prompts)"
+    )]
     prompt: Option<String>,
 
     #[arg(long = "gemini-oauth")]
@@ -55,8 +58,12 @@ struct Args {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Generate a nitpicker.toml template in the current directory
-    Init,
+    /// Generate a nitpicker config template
+    Init {
+        /// Write to ~/.nitpicker/config.toml instead of ./nitpicker.toml
+        #[arg(long)]
+        global: bool,
+    },
     /// Ask multiple LLM agents a free-form question about the codebase
     Ask {
         #[command(flatten)]
@@ -75,6 +82,9 @@ enum Command {
 const INIT_TEMPLATE: &str = r#"[aggregator]
 model = "claude-sonnet-4-6"
 provider = "anthropic"
+
+[defaults]
+debate = false
 
 [[reviewer]]
 name = "claude"
@@ -110,13 +120,16 @@ async fn main() -> Result<()> {
         .init();
 
     match args.command {
-        Some(Command::Init) => {
-            let path = Path::new("nitpicker.toml");
+        Some(Command::Init { global }) => {
+            let path = init_config_path(global)?;
             if path.exists() {
-                eyre::bail!("nitpicker.toml already exists");
+                eyre::bail!("{} already exists", path.display());
             }
-            std::fs::write(path, INIT_TEMPLATE)?;
-            println!("Created nitpicker.toml");
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&path, INIT_TEMPLATE)?;
+            println!("Created {}", path.display());
             return Ok(());
         }
         Some(Command::Ask {
@@ -130,7 +143,7 @@ async fn main() -> Result<()> {
                 eyre::bail!("--repo must point to a git repository (missing .git)");
             }
             let config = load_config(common.config.as_deref(), &repo)?;
-            if debate {
+            if debate || config.default_debate() {
                 return debate::run_debate(
                     &repo,
                     &topic,
@@ -141,7 +154,14 @@ async fn main() -> Result<()> {
                 )
                 .await;
             } else {
-                let report = review::run_review(&repo, &topic, &config, common.verbose, review::TaskMode::Ask).await?;
+                let report = review::run_review(
+                    &repo,
+                    &topic,
+                    &config,
+                    common.verbose,
+                    review::TaskMode::Ask,
+                )
+                .await?;
                 println!("{report}");
                 return Ok(());
             }
@@ -184,13 +204,14 @@ async fn main() -> Result<()> {
         };
         build_analysis_prompt(path_opt, args.prompt.as_deref())
     } else {
+        let base = detect_diff_context(&repo)?;
         match args.prompt {
-            Some(p) => p,
-            None => detect_diff_context(&repo)?,
+            Some(p) => format!("{base}\n\nAdditional instructions: {p}"),
+            None => base,
         }
     };
 
-    if args.debate {
+    if args.debate || config.default_debate() {
         debate::run_debate(
             &repo,
             &prompt,
@@ -201,7 +222,14 @@ async fn main() -> Result<()> {
         )
         .await
     } else {
-        let report = review::run_review(&repo, &prompt, &config, args.common.verbose, review::TaskMode::Review).await?;
+        let report = review::run_review(
+            &repo,
+            &prompt,
+            &config,
+            args.common.verbose,
+            review::TaskMode::Review,
+        )
+        .await?;
         println!("{report}");
         Ok(())
     }
@@ -239,6 +267,16 @@ fn load_config(explicit_path: Option<&Path>, repo: &Path) -> Result<config::Conf
          or at global location:\n  \
          ~/.nitpicker/config.toml"
     )
+}
+
+fn init_config_path(global: bool) -> Result<PathBuf> {
+    if global {
+        let home =
+            dirs::home_dir().ok_or_else(|| eyre::eyre!("failed to resolve home directory"))?;
+        Ok(home.join(".nitpicker").join("config.toml"))
+    } else {
+        Ok(Path::new("nitpicker.toml").to_path_buf())
+    }
 }
 
 fn build_analysis_prompt(path: Option<&Path>, custom_prompt: Option<&str>) -> String {

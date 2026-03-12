@@ -57,11 +57,17 @@ Configuration is loaded from (first match wins):
 ```bash
 # create a config in current directory
 nitpicker init
+
+# create a global config at ~/.nitpicker/config.toml
+nitpicker init --global
 ```
 
 Example `nitpicker.toml`:
 
 ```toml
+[defaults]
+debate = false         # optional, default: false
+
 [aggregator]
 model = "claude-sonnet-4-6"
 provider = "anthropic"
@@ -83,6 +89,8 @@ api_key_env = "OPENAI_API_KEY"
 It is recommended to use providers that were not used for the initial building to enforce diversity of thought. 
 
 Unknown config keys are rejected. For example, use `max_tokens` for output length; `token_limit` is not a supported field.
+
+Set `[defaults].debate = true` to enable debate mode by default for both `nitpicker` and `nitpicker ask`. Passing `--debate` still works and explicitly enables debate for a single run.
 
 ### Provider types
 
@@ -123,7 +131,7 @@ This opens a browser, completes the OAuth flow, and saves the token to `~/.nitpi
 ```
 nitpicker [OPTIONS]
 nitpicker ask [--debate] [--rounds N] [OPTIONS] <topic>
-nitpicker init
+nitpicker init [--global]
 ```
 
 ### Review (default)
