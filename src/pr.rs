@@ -76,6 +76,94 @@ pub fn parse_pr_url(url: &str) -> Result<(String, u32)> {
     }
 }
 
+/// Extracts `owner/repo` from a git remote URL (https or ssh).
+fn slug_from_remote_url(url: &str) -> Option<String> {
+    let url = url.trim().trim_end_matches(".git");
+    if let Ok(parsed) = url::Url::parse(url) {
+        let path = parsed.path().trim_start_matches('/');
+        let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        if parts.len() >= 2 {
+            return Some(format!("{}/{}", parts[0], parts[1]));
+        }
+    }
+    // git@github.com:owner/repo
+    if let Some(colon) = url.find(':') {
+        let after = &url[colon + 1..];
+        let parts: Vec<&str> = after.split('/').filter(|s| !s.is_empty()).collect();
+        if parts.len() >= 2 {
+            return Some(format!("{}/{}", parts[0], parts[1]));
+        }
+    }
+    None
+}
+
+fn get_origin_slug(repo: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .current_dir(repo)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    slug_from_remote_url(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn get_current_branch(repo: &Path) -> Result<String> {
+    let out = Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(repo)
+        .output()
+        .wrap_err("failed to get current branch")?;
+    if !out.status.success() {
+        eyre::bail!("failed to get current branch");
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn restore_branch(repo: &Path, branch: &str) {
+    let _ = Command::new("git")
+        .args(["checkout", branch])
+        .current_dir(repo)
+        .output();
+}
+
+/// Fetches the PR head and checks it out as a local branch `pr-{pr_number}`.
+/// Works in both full clones (same-repo) and shallow clones (temp dir).
+fn checkout_pr_branch(repo: &Path, pr_number: u32) -> Result<()> {
+    let refspec = format!("refs/pull/{pr_number}/head");
+    let out = Command::new("git")
+        .args(["fetch", "origin", &refspec])
+        .current_dir(repo)
+        .output()
+        .wrap_err("failed to fetch PR branch")?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        eyre::bail!("git fetch failed: {}", stderr.trim());
+    }
+
+    let branch = format!("pr-{pr_number}");
+    // delete stale local branch if present
+    let _ = Command::new("git")
+        .args(["branch", "-D", &branch])
+        .current_dir(repo)
+        .output();
+
+    let out = Command::new("git")
+        .args(["checkout", "-b", &branch, "FETCH_HEAD"])
+        .current_dir(repo)
+        .output()
+        .wrap_err("failed to checkout PR branch")?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        eyre::bail!(
+            "git checkout failed: {}\nMake sure your working tree is clean before reviewing a PR.",
+            stderr.trim()
+        );
+    }
+    Ok(())
+}
+
 fn clone_pr(repo_slug: &str, pr_number: u32, pr_commit_count: usize, dir: &Path) -> Result<()> {
     let clone_url = format!("https://github.com/{repo_slug}.git");
     // fetch enough history so the base branch commit is reachable for diffing
@@ -89,17 +177,7 @@ fn clone_pr(repo_slug: &str, pr_number: u32, pr_commit_count: usize, dir: &Path)
         let stderr = String::from_utf8_lossy(&out.stderr);
         eyre::bail!("git clone failed: {}", stderr.trim());
     }
-
-    let out = Command::new("gh")
-        .args(["pr", "checkout", &pr_number.to_string()])
-        .current_dir(dir)
-        .output()
-        .wrap_err("failed to run gh pr checkout")?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        eyre::bail!("gh pr checkout failed: {}", stderr.trim());
-    }
-    Ok(())
+    checkout_pr_branch(dir, pr_number)
 }
 
 fn post_comment(url: Option<&str>, repo: &Path, body: &str) -> Result<()> {
@@ -135,24 +213,40 @@ pub async fn run_pr(args: PrArgs, config: Config) -> Result<()> {
     check_gh()?;
 
     let verbose = args.common.verbose;
-
-    // for the remote path we hold the TempDir guard here so Drop runs on any exit
     let _tmpdir_guard: Option<tempfile::TempDir>;
+
+    // original_branch is set when we checkout a PR branch in the user's own repo
+    // so we can restore it after the review
+    let original_branch: Option<(PathBuf, String)>;
 
     let (repo, url_for_gh): (PathBuf, Option<String>) = if let Some(ref u) = args.url {
         let (repo_slug, pr_number) = parse_pr_url(u)?;
+        let repo = args.common.repo.canonicalize()?;
 
-        // fetch metadata first (works from any dir) to get commit count for depth calculation
-        let meta_for_depth = fetch_pr_meta(Some(u), Path::new("."))?;
-        let pr_commit_count = meta_for_depth.commits.len();
-
-        let tmpdir = tempfile::TempDir::new().wrap_err("failed to create temp dir")?;
-        let path = tmpdir.path().to_path_buf();
-        clone_pr(&repo_slug, pr_number, pr_commit_count, &path)?;
-        _tmpdir_guard = Some(tmpdir);
-        (path, Some(u.clone()))
+        if get_origin_slug(&repo).as_deref() == Some(&repo_slug) {
+            // same repo — check out the PR branch in place
+            let branch = get_current_branch(&repo)?;
+            checkout_pr_branch(&repo, pr_number).map_err(|e| {
+                restore_branch(&repo, &branch);
+                e
+            })?;
+            original_branch = Some((repo.clone(), branch));
+            _tmpdir_guard = None;
+            (repo, Some(u.clone()))
+        } else {
+            // different repo — clone into a temp dir
+            let meta_for_depth = fetch_pr_meta(Some(u), Path::new("."))?;
+            let pr_commit_count = meta_for_depth.commits.len();
+            let tmpdir = tempfile::TempDir::new().wrap_err("failed to create temp dir")?;
+            let path = tmpdir.path().to_path_buf();
+            clone_pr(&repo_slug, pr_number, pr_commit_count, &path)?;
+            _tmpdir_guard = Some(tmpdir);
+            original_branch = None;
+            (path, Some(u.clone()))
+        }
     } else {
         _tmpdir_guard = None;
+        original_branch = None;
         let repo = args.common.repo.canonicalize()?;
         if !repo.join(".git").is_dir() {
             eyre::bail!("--repo must point to a git repository (missing .git)");
@@ -160,8 +254,24 @@ pub async fn run_pr(args: PrArgs, config: Config) -> Result<()> {
         (repo, None)
     };
 
-    let meta = fetch_pr_meta(url_for_gh.as_deref(), &repo)?;
-    let diff_context = crate::detect_diff_context(&repo)?;
+    let result = run_review_inner(&repo, url_for_gh.as_deref(), &args, &config, verbose).await;
+
+    if let Some((ref restore_repo, ref branch)) = original_branch {
+        restore_branch(restore_repo, branch);
+    }
+
+    result
+}
+
+async fn run_review_inner(
+    repo: &Path,
+    url_for_gh: Option<&str>,
+    args: &PrArgs,
+    config: &Config,
+    verbose: bool,
+) -> Result<()> {
+    let meta = fetch_pr_meta(url_for_gh, repo)?;
+    let diff_context = crate::detect_diff_context(repo)?;
     let full_prompt = build_pr_prompt(&meta, &diff_context, args.prompt.as_deref());
 
     if args.debate || config.default_debate() {
@@ -169,23 +279,17 @@ pub async fn run_pr(args: PrArgs, config: Config) -> Result<()> {
             eprintln!("note: --debate mode output will be printed but not posted as a PR comment (not yet supported)");
         }
         debate::run_debate(
-            &repo,
+            repo,
             &full_prompt,
-            &config,
+            config,
             args.rounds,
             verbose,
             DebateMode::Review,
         )
         .await?;
     } else {
-        let report = review::run_review(
-            &repo,
-            &full_prompt,
-            &config,
-            verbose,
-            TaskMode::Review,
-        )
-        .await?;
+        let report = review::run_review(repo, &full_prompt, config, verbose, TaskMode::Review)
+            .await?;
 
         println!("{report}");
 
@@ -193,10 +297,9 @@ pub async fn run_pr(args: PrArgs, config: Config) -> Result<()> {
             let comment = format!(
                 "{report}\n\n---\n🔍 Reviewed by [nitpicker](https://github.com/arsenyinfo/nitpicker)"
             );
-            post_comment(url_for_gh.as_deref(), &repo, &comment)?;
+            post_comment(url_for_gh, repo, &comment)?;
         }
     }
 
-    // _tmpdir_guard drops here, auto-cleaning the temp dir
     Ok(())
 }
