@@ -79,15 +79,16 @@ pub fn parse_pr_url(url: &str) -> Result<(String, u32)> {
 /// Extracts `owner/repo` from a git remote URL (https or ssh).
 fn slug_from_remote_url(url: &str) -> Option<String> {
     let url = url.trim().trim_end_matches(".git");
-    if let Ok(parsed) = url::Url::parse(url) {
+    if url.contains("://") {
+        // https://github.com/owner/repo
+        let parsed = url::Url::parse(url).ok()?;
         let path = parsed.path().trim_start_matches('/');
         let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
         if parts.len() >= 2 {
             return Some(format!("{}/{}", parts[0], parts[1]));
         }
-    }
-    // git@github.com:owner/repo
-    if let Some(colon) = url.find(':') {
+    } else if let Some(colon) = url.find(':') {
+        // git@github.com:owner/repo
         let after = &url[colon + 1..];
         let parts: Vec<&str> = after.split('/').filter(|s| !s.is_empty()).collect();
         if parts.len() >= 2 {
@@ -122,10 +123,18 @@ fn get_current_branch(repo: &Path) -> Result<String> {
 }
 
 fn restore_branch(repo: &Path, branch: &str) {
-    let _ = Command::new("git")
+    match Command::new("git")
         .args(["checkout", branch])
         .current_dir(repo)
-        .output();
+        .output()
+    {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            eprintln!("warning: failed to restore branch '{branch}': {}", stderr.trim());
+        }
+        Err(e) => eprintln!("warning: failed to restore branch '{branch}': {e}"),
+    }
 }
 
 /// Fetches the PR head and checks it out as a local branch `pr-{pr_number}`.
@@ -166,8 +175,8 @@ fn checkout_pr_branch(repo: &Path, pr_number: u32) -> Result<()> {
 
 fn clone_pr(repo_slug: &str, pr_number: u32, pr_commit_count: usize, dir: &Path) -> Result<()> {
     let clone_url = format!("https://github.com/{repo_slug}.git");
-    // fetch enough history so the base branch commit is reachable for diffing
-    let depth = std::cmp::max(5, pr_commit_count + 5).to_string();
+    // use a generous depth: PR commits + buffer for base branch reachability and merge commits
+    let depth = std::cmp::max(50, pr_commit_count * 2 + 20).to_string();
     let out = Command::new("git")
         .args(["clone", "--depth", &depth, &clone_url, "."])
         .current_dir(dir)
@@ -221,7 +230,11 @@ pub async fn run_pr(args: PrArgs, config: Config) -> Result<()> {
 
     let (repo, url_for_gh): (PathBuf, Option<String>) = if let Some(ref u) = args.url {
         let (repo_slug, pr_number) = parse_pr_url(u)?;
-        let repo = args.common.repo.canonicalize()?;
+        let repo_raw = &args.common.repo;
+        if !repo_raw.join(".git").is_dir() {
+            eyre::bail!("--repo must point to a git repository (missing .git)");
+        }
+        let repo = repo_raw.canonicalize()?;
 
         if get_origin_slug(&repo).as_deref() == Some(&repo_slug) {
             // same repo — check out the PR branch in place
@@ -235,7 +248,8 @@ pub async fn run_pr(args: PrArgs, config: Config) -> Result<()> {
             (repo, Some(u.clone()))
         } else {
             // different repo — clone into a temp dir
-            let meta_for_depth = fetch_pr_meta(Some(u), Path::new("."))?;
+            let cwd = std::env::current_dir().wrap_err("failed to get current directory")?;
+            let meta_for_depth = fetch_pr_meta(Some(u), &cwd)?;
             let pr_commit_count = meta_for_depth.commits.len();
             let tmpdir = tempfile::TempDir::new().wrap_err("failed to create temp dir")?;
             let path = tmpdir.path().to_path_buf();
@@ -247,11 +261,11 @@ pub async fn run_pr(args: PrArgs, config: Config) -> Result<()> {
     } else {
         _tmpdir_guard = None;
         original_branch = None;
-        let repo = args.common.repo.canonicalize()?;
-        if !repo.join(".git").is_dir() {
+        let repo_raw = &args.common.repo;
+        if !repo_raw.join(".git").is_dir() {
             eyre::bail!("--repo must point to a git repository (missing .git)");
         }
-        (repo, None)
+        (repo_raw.canonicalize()?, None)
     };
 
     let result = run_review_inner(&repo, url_for_gh.as_deref(), &args, &config, verbose).await;
