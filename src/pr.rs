@@ -58,13 +58,18 @@ fn fetch_pr_meta(url: Option<&str>, repo: &Path) -> Result<PrMeta> {
 pub fn parse_pr_url(url: &str) -> Result<(String, u32)> {
     // expects https://github.com/owner/repo/pull/N
     let url_obj = url::Url::parse(url).wrap_err("invalid URL")?;
+    match url_obj.host_str() {
+        Some("github.com") => {}
+        Some(host) => eyre::bail!("only GitHub PRs are supported (got host: {host})"),
+        None => eyre::bail!("URL has no host"),
+    }
     let segments: Vec<&str> = url_obj
         .path_segments()
         .ok_or_else(|| eyre::eyre!("URL has no path"))?
         .filter(|s| !s.is_empty())
         .collect();
     match segments.as_slice() {
-        [owner, repo, "pull", n] => {
+        [owner, repo, "pull", n, ..] => {
             let pr_number: u32 = n
                 .parse()
                 .wrap_err_with(|| format!("PR number `{n}` is not a valid integer"))?;
@@ -88,7 +93,7 @@ fn slug_from_remote_url(url: &str) -> Option<String> {
             return Some(format!("{}/{}", parts[0], parts[1]));
         }
     } else if let Some(colon) = url.find(':') {
-        // git@github.com:owner/repo
+        // git@github.com:owner/repo or hostname:owner/repo (custom ~/.ssh/config alias)
         let after = &url[colon + 1..];
         let parts: Vec<&str> = after.split('/').filter(|s| !s.is_empty()).collect();
         if parts.len() >= 2 {
@@ -111,13 +116,23 @@ fn get_origin_slug(repo: &Path) -> Option<String> {
 }
 
 fn get_current_branch(repo: &Path) -> Result<String> {
+    // symbolic-ref succeeds for attached HEAD, fails for detached
     let out = Command::new("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .args(["symbolic-ref", "-q", "--short", "HEAD"])
         .current_dir(repo)
         .output()
         .wrap_err("failed to get current branch")?;
+    if out.status.success() {
+        return Ok(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    }
+    // detached HEAD — return commit hash so restore_branch can check it out
+    let out = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo)
+        .output()
+        .wrap_err("failed to get current commit")?;
     if !out.status.success() {
-        eyre::bail!("failed to get current branch");
+        eyre::bail!("failed to get current branch or commit");
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
@@ -137,8 +152,9 @@ fn restore_branch(repo: &Path, branch: &str) {
     }
 }
 
-/// Fetches the PR head and checks it out as a local branch `pr-{pr_number}`.
-/// Works in both full clones (same-repo) and shallow clones (temp dir).
+/// Fetches the PR head and checks it out as a local branch `nitpicker/pr-{pr_number}`.
+/// Uses a namespaced name to avoid colliding with or deleting any user-owned branch.
+/// Always fetches so the review is always against the actual PR head, not stale local state.
 fn checkout_pr_branch(repo: &Path, pr_number: u32) -> Result<()> {
     let refspec = format!("refs/pull/{pr_number}/head");
     let out = Command::new("git")
@@ -151,8 +167,27 @@ fn checkout_pr_branch(repo: &Path, pr_number: u32) -> Result<()> {
         eyre::bail!("git fetch failed: {}", stderr.trim());
     }
 
-    let branch = format!("pr-{pr_number}");
-    // delete stale local branch if present
+    // namespaced branch — safe to delete, will never match a user branch
+    let branch = format!("nitpicker/pr-{pr_number}");
+
+    if get_current_branch(repo).ok().as_deref() == Some(branch.as_str()) {
+        // already on our tracking branch — fast-forward only, so uncommitted changes cause a safe failure
+        let out = Command::new("git")
+            .args(["merge", "--ff-only", "FETCH_HEAD"])
+            .current_dir(repo)
+            .output()
+            .wrap_err("failed to fast-forward PR branch")?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            eyre::bail!(
+                "could not fast-forward to PR head: {}\nMake sure your working tree is clean before reviewing a PR.",
+                stderr.trim()
+            );
+        }
+        return Ok(());
+    }
+
+    // delete stale local branch if present (safe: it's our namespace, not a user branch)
     let _ = Command::new("git")
         .args(["branch", "-D", &branch])
         .current_dir(repo)
@@ -228,47 +263,52 @@ pub async fn run_pr(args: PrArgs, config: Config) -> Result<()> {
     // so we can restore it after the review
     let original_branch: Option<(PathBuf, String)>;
 
-    let (repo, url_for_gh): (PathBuf, Option<String>) = if let Some(ref u) = args.url {
-        let (repo_slug, pr_number) = parse_pr_url(u)?;
-        let repo_raw = &args.common.repo;
-        if !repo_raw.join(".git").is_dir() {
-            eyre::bail!("--repo must point to a git repository (missing .git)");
-        }
-        let repo = repo_raw.canonicalize()?;
+    let (repo, url_for_gh, meta): (PathBuf, Option<String>, PrMeta) =
+        if let Some(ref u) = args.url {
+            let (repo_slug, pr_number) = parse_pr_url(u)?;
+            let repo_raw = &args.common.repo;
+            if !repo_raw.join(".git").exists() {
+                eyre::bail!("--repo must point to a git repository (missing .git)");
+            }
+            let repo = repo_raw.canonicalize()?;
 
-        if get_origin_slug(&repo).as_deref() == Some(&repo_slug) {
-            // same repo — check out the PR branch in place
-            let branch = get_current_branch(&repo)?;
-            checkout_pr_branch(&repo, pr_number).map_err(|e| {
-                restore_branch(&repo, &branch);
-                e
-            })?;
-            original_branch = Some((repo.clone(), branch));
-            _tmpdir_guard = None;
-            (repo, Some(u.clone()))
+            if get_origin_slug(&repo).as_deref() == Some(&repo_slug) {
+                // fetch meta first — a failure here leaves the branch untouched
+                let meta = fetch_pr_meta(Some(u), &repo)?;
+                let branch = get_current_branch(&repo)?;
+                checkout_pr_branch(&repo, pr_number).map_err(|e| {
+                    restore_branch(&repo, &branch);
+                    e
+                })?;
+                original_branch = Some((repo.clone(), branch));
+                _tmpdir_guard = None;
+                (repo, Some(u.clone()), meta)
+            } else {
+                // different repo — clone into a temp dir
+                let cwd = std::env::current_dir().wrap_err("failed to get current directory")?;
+                let meta = fetch_pr_meta(Some(u), &cwd)?;
+                let pr_commit_count = meta.commits.len();
+                let tmpdir = tempfile::TempDir::new().wrap_err("failed to create temp dir")?;
+                let path = tmpdir.path().to_path_buf();
+                clone_pr(&repo_slug, pr_number, pr_commit_count, &path)?;
+                _tmpdir_guard = Some(tmpdir);
+                original_branch = None;
+                (path, Some(u.clone()), meta)
+            }
         } else {
-            // different repo — clone into a temp dir
-            let cwd = std::env::current_dir().wrap_err("failed to get current directory")?;
-            let meta_for_depth = fetch_pr_meta(Some(u), &cwd)?;
-            let pr_commit_count = meta_for_depth.commits.len();
-            let tmpdir = tempfile::TempDir::new().wrap_err("failed to create temp dir")?;
-            let path = tmpdir.path().to_path_buf();
-            clone_pr(&repo_slug, pr_number, pr_commit_count, &path)?;
-            _tmpdir_guard = Some(tmpdir);
+            _tmpdir_guard = None;
             original_branch = None;
-            (path, Some(u.clone()))
-        }
-    } else {
-        _tmpdir_guard = None;
-        original_branch = None;
-        let repo_raw = &args.common.repo;
-        if !repo_raw.join(".git").is_dir() {
-            eyre::bail!("--repo must point to a git repository (missing .git)");
-        }
-        (repo_raw.canonicalize()?, None)
-    };
+            let repo_raw = &args.common.repo;
+            if !repo_raw.join(".git").exists() {
+                eyre::bail!("--repo must point to a git repository (missing .git)");
+            }
+            let repo = repo_raw.canonicalize()?;
+            let meta = fetch_pr_meta(None, &repo)?;
+            (repo, None, meta)
+        };
 
-    let result = run_review_inner(&repo, url_for_gh.as_deref(), &args, &config, verbose).await;
+    let result =
+        run_review_inner(&repo, url_for_gh.as_deref(), &args, &config, verbose, &meta).await;
 
     if let Some((ref restore_repo, ref branch)) = original_branch {
         restore_branch(restore_repo, branch);
@@ -283,10 +323,10 @@ async fn run_review_inner(
     args: &PrArgs,
     config: &Config,
     verbose: bool,
+    meta: &PrMeta,
 ) -> Result<()> {
-    let meta = fetch_pr_meta(url_for_gh, repo)?;
     let diff_context = crate::detect_diff_context(repo)?;
-    let full_prompt = build_pr_prompt(&meta, &diff_context, args.prompt.as_deref());
+    let full_prompt = build_pr_prompt(meta, &diff_context, args.prompt.as_deref());
 
     if args.debate || config.default_debate() {
         if !args.no_comment {
