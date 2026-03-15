@@ -1,6 +1,6 @@
 [package]
 name = "nitpicker"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.85"
 default-run = "nitpicker"
@@ -38,3 +38,4 @@ base64 = "0.22"
 uuid = { version = "1", features = ["v4"] }
 url = "2"
 webbrowser = "1"
+tempfile = "3"
