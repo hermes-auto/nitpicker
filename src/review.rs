@@ -1,4 +1,6 @@
-use crate::agent::{AgentConfig, AgentDepth, add_spawn_subagent_tool, run_agent};
+use crate::agent::{
+    AgentConfig, AgentDepth, AgentProgress, add_spawn_subagent_tool, run_agent,
+};
 use crate::config::{Config, ProviderType, ReviewerConfig};
 use crate::llm::{Completion, FinishReason, LLMClient, LLMProvider, WithRetryExt};
 pub use crate::prompts::TaskMode;
@@ -75,7 +77,7 @@ pub async fn run_review(
         let done = done_style.clone();
         let initial_message = initial_message.clone();
         let handle: JoinHandle<(String, Result<String>)> = tokio::spawn(async move {
-            let config = match agent_config {
+            let mut config = match agent_config {
                 Ok(config) => config,
                 Err(err) => {
                     pb.set_style(done.clone());
@@ -83,14 +85,23 @@ pub async fn run_review(
                     return (name, Err(err));
                 }
             };
+            if !verbose {
+                let progress_pb = pb.clone();
+                config.progress = Some(Arc::new(move |progress: AgentProgress| {
+                    progress_pb.set_message(format!(
+                        "reviewing… ({} turns, {} tool calls, {} subagents)",
+                        progress.turns, progress.tool_calls, progress.subagents_spawned
+                    ));
+                }));
+            }
             let start = Instant::now();
             let result = run_agent(config, &initial_message, &tools_map, &repo).await;
             let elapsed = start.elapsed().as_secs();
             pb.set_style(done);
             match &result {
                 Ok(r) => pb.finish_with_message(format!(
-                    "✓ done ({elapsed}s, {} turns, {} subagents)",
-                    r.turns, r.subagents_spawned
+                    "✓ done ({elapsed}s, {} turns, {} tool calls, {} subagents, {} output tokens)",
+                    r.turns, r.tool_calls, r.subagents_spawned, r.total_output_tokens
                 )),
                 Err(e) => pb.finish_with_message(format!("✗ failed: {e}")),
             }
@@ -259,6 +270,7 @@ async fn build_agent_config(
         empty_response_nudge: None,
         max_empty_responses: 0,
         subagent_counter,
+        progress: None,
     })
 }
 

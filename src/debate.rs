@@ -1,5 +1,7 @@
 use crate::config::{Config, ProviderType, ReviewerConfig};
-use crate::agent::{AgentConfig, AgentDepth, add_spawn_subagent_tool, run_agent};
+use crate::agent::{
+    AgentConfig, AgentDepth, AgentProgress, add_spawn_subagent_tool, run_agent,
+};
 use crate::llm::{Completion, LLMClient, LLMClientDyn, LLMProvider, WithRetryExt};
 pub use crate::prompts::DebateMode;
 use crate::tools::{Tool, all_tools};
@@ -86,7 +88,8 @@ async fn run_debate_turn(
     initial_message: &str,
     max_turns: usize,
     work_dir: &Path,
-) -> Result<(DebateVerdict, usize, usize)> {
+    progress: Option<Arc<dyn Fn(AgentProgress) + Send + Sync>>,
+) -> Result<(DebateVerdict, usize, usize, usize, u64)> {
     let verdict_store: Arc<Mutex<Option<DebateVerdict>>> = Arc::new(Mutex::new(None));
     let submit_tool = Arc::new(SubmitVerdictTool {
         verdict: Arc::clone(&verdict_store),
@@ -107,6 +110,7 @@ async fn run_debate_turn(
         empty_response_nudge: Some("Please proceed with your analysis and call submit_verdict when you are done.".to_string()),
         max_empty_responses: 3,
         subagent_counter,
+        progress,
     };
 
     let result = run_agent(config, initial_message, &tools_map, work_dir).await?;
@@ -115,7 +119,13 @@ async fn run_debate_turn(
         .unwrap_or_else(|e| e.into_inner())
         .take()
     {
-        return Ok((verdict, result.tool_calls, result.subagents_spawned));
+        return Ok((
+            verdict,
+            result.turns,
+            result.tool_calls,
+            result.subagents_spawned,
+            result.total_output_tokens,
+        ));
     }
 
     Ok((
@@ -123,8 +133,10 @@ async fn run_debate_turn(
             text: result.text,
             agree: false,
         },
+        result.turns,
         result.tool_calls,
         result.subagents_spawned,
+        result.total_output_tokens,
     ))
 }
 
@@ -317,19 +329,27 @@ pub async fn run_debate(
         pb.set_message(format!("round {round} — debating…"));
         let msg = build_turn_message(prompt, &verdicts, round, actor_role);
         let start = std::time::Instant::now();
-        let (verdict, tool_calls, subagents_spawned) = run_debate_turn(
+        let actor_pb = pb.clone();
+        let actor_progress = (!verbose).then_some(Arc::new(move |progress: AgentProgress| {
+            actor_pb.set_message(format!(
+                "round {round} — debating… ({} turns, {} tool calls, {} subagents)",
+                progress.turns, progress.tool_calls, progress.subagents_spawned
+            ));
+        }) as Arc<dyn Fn(AgentProgress) + Send + Sync>);
+        let (verdict, turns, tool_calls, subagents_spawned, total_output_tokens) = run_debate_turn(
             Arc::clone(&actor_client),
             &actor_cfg.model,
             &actor_system,
             &msg,
             max_turns,
             repo,
+            actor_progress,
         )
         .await?;
         let elapsed = start.elapsed().as_secs();
         pb.set_style(done_style.clone());
         pb.finish_with_message(format!(
-            "✓ round {round} ({tool_calls} tool calls, {subagents_spawned} subagents, {elapsed}s)"
+            "✓ round {round} ({turns} turns, {tool_calls} tool calls, {subagents_spawned} subagents, {total_output_tokens} output tokens, {elapsed}s)"
         ));
         println!();
         skin.print_text(&verdict.text);
@@ -341,19 +361,27 @@ pub async fn run_debate(
         pb.set_message(format!("round {round} — debating…"));
         let msg = build_turn_message(prompt, &verdicts, round, critic_role);
         let start = std::time::Instant::now();
-        let (verdict, tool_calls, subagents_spawned) = run_debate_turn(
+        let critic_pb = pb.clone();
+        let critic_progress = (!verbose).then_some(Arc::new(move |progress: AgentProgress| {
+            critic_pb.set_message(format!(
+                "round {round} — debating… ({} turns, {} tool calls, {} subagents)",
+                progress.turns, progress.tool_calls, progress.subagents_spawned
+            ));
+        }) as Arc<dyn Fn(AgentProgress) + Send + Sync>);
+        let (verdict, turns, tool_calls, subagents_spawned, total_output_tokens) = run_debate_turn(
             Arc::clone(&critic_client),
             &critic_cfg.model,
             &critic_system,
             &msg,
             max_turns,
             repo,
+            critic_progress,
         )
         .await?;
         let elapsed = start.elapsed().as_secs();
         pb.set_style(done_style.clone());
         pb.finish_with_message(format!(
-            "✓ round {round} ({tool_calls} tool calls, {subagents_spawned} subagents, {elapsed}s)"
+            "✓ round {round} ({turns} turns, {tool_calls} tool calls, {subagents_spawned} subagents, {total_output_tokens} output tokens, {elapsed}s)"
         ));
         println!();
         skin.print_text(&verdict.text);
