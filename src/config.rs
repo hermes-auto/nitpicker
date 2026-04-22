@@ -16,6 +16,7 @@ pub struct Config {
 pub struct DefaultsConfig {
     pub debate: Option<bool>,
     pub max_turns: Option<usize>,
+    pub compact_threshold: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -38,6 +39,7 @@ pub struct ReviewerConfig {
     pub provider: ProviderType,
     pub base_url: Option<String>,
     pub api_key_env: Option<String>,
+    pub compact_threshold: Option<u64>,
     /// Authentication method: "api_key" (default) or "oauth"
     pub auth: Option<String>,
 }
@@ -57,20 +59,6 @@ pub enum ProviderType {
 impl ProviderType {
     pub fn is_gemini(&self) -> bool {
         matches!(self, ProviderType::Gemini)
-    }
-}
-
-impl AggregatorConfig {
-    /// Returns true if OAuth should be used for authentication
-    pub fn use_oauth(&self) -> bool {
-        self.auth.as_ref().map(|a| a == "oauth").unwrap_or(false)
-    }
-}
-
-impl ReviewerConfig {
-    /// Returns true if OAuth should be used for authentication
-    pub fn use_oauth(&self) -> bool {
-        self.auth.as_ref().map(|a| a == "oauth").unwrap_or(false)
     }
 }
 
@@ -101,5 +89,18 @@ impl Config {
         }
 
         Ok(max_turns)
+    }
+
+    pub fn default_compact_threshold(&self) -> Result<Option<u64>> {
+        let threshold = self
+            .defaults
+            .as_ref()
+            .and_then(|defaults| defaults.compact_threshold);
+
+        if threshold == Some(0) {
+            eyre::bail!("[defaults].compact_threshold must be greater than 0")
+        }
+
+        Ok(threshold)
     }
 }

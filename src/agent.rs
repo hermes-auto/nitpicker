@@ -1,4 +1,5 @@
-use crate::llm::{Completion, LLMClientDyn};
+use crate::compact::compact_history;
+use crate::llm::{Completion, ConversationUsageWindow, LLMClientDyn};
 use crate::prompts::subagent_system_prompt;
 use crate::tools::{Tool, floor_char_boundary, tool_definitions};
 use eyre::Result;
@@ -21,7 +22,9 @@ pub struct AgentResult {
     pub turns: usize,
     pub tool_calls: usize,
     pub subagents_spawned: usize,
+    pub total_input_tokens: u64,
     pub total_output_tokens: u64,
+    pub total_tokens: u64,
 }
 
 pub struct AgentProgress {
@@ -57,6 +60,7 @@ pub struct AgentConfig {
     pub name: String,
     pub model: String,
     pub max_turns: usize,
+    pub compact_threshold: Option<u64>,
     pub system_prompt: String,
     pub client: Arc<dyn LLMClientDyn>,
     pub depth: AgentDepth,
@@ -146,7 +150,10 @@ pub async fn run_agent(
     let mut history = Vec::new();
     let mut prompt = Message::user(initial_message.to_string());
     history.push(prompt.clone());
+    let mut total_input_tokens = 0u64;
     let mut total_output_tokens = 0u64;
+    let mut total_tokens = 0u64;
+    let mut conversation_usage = ConversationUsageWindow::new(config.compact_threshold);
     let mut total_tool_calls = 0usize;
     let mut empty_response_count = 0usize;
     let mut last_tool_call_key: Option<String> = None;
@@ -155,6 +162,26 @@ pub async fn run_agent(
     let initial_subagent_count = config.subagent_counter.load(Ordering::Relaxed);
 
     for turn in 0..config.max_turns {
+        if conversation_usage.should_compact() {
+            let usage_before_compaction = conversation_usage.usage();
+            if let Some(compaction_usage) = compact_history(
+                Arc::clone(&config.client),
+                &config.model,
+                &config.system_prompt,
+                &mut history,
+                &mut prompt,
+                turn + 1,
+                usage_before_compaction,
+            )
+            .await?
+            {
+                total_input_tokens += compaction_usage.input_tokens;
+                total_output_tokens += compaction_usage.output_tokens;
+                total_tokens += compaction_usage.total_tokens;
+                conversation_usage.reset();
+            }
+        }
+
         let completion = Completion {
             model: config.model.clone(),
             prompt: prompt.clone(),
@@ -167,7 +194,10 @@ pub async fn run_agent(
         };
 
         let response = config.client.completion(completion).await?;
-        total_output_tokens += response.output_tokens;
+        total_input_tokens += response.usage.input_tokens;
+        total_output_tokens += response.usage.output_tokens;
+        total_tokens += response.usage.total_tokens;
+        conversation_usage.record(response.usage);
         let assistant_message = response.message();
         history.push(assistant_message.clone());
 
@@ -230,8 +260,12 @@ pub async fn run_agent(
                     info!(
                         agent = %config.name,
                         turn,
-                        output_tokens = response.output_tokens,
+                        input_tokens = response.usage.input_tokens,
+                        output_tokens = response.usage.output_tokens,
+                        total_tokens = response.usage.total_tokens,
+                        total_input_tokens,
                         total_output_tokens,
+                        total_tokens_so_far = total_tokens,
                         response_len = result.len(),
                         "subagent finished"
                     );
@@ -241,7 +275,9 @@ pub async fn run_agent(
                         tool_calls: total_tool_calls,
                         subagents_spawned: config.subagent_counter.load(Ordering::Relaxed)
                             - initial_subagent_count,
+                        total_input_tokens,
                         total_output_tokens,
+                        total_tokens,
                     });
                 }
             }
@@ -251,7 +287,9 @@ pub async fn run_agent(
                     agent = %config.name,
                     turn,
                     total_tool_calls,
+                    total_input_tokens,
                     total_output_tokens,
+                    total_tokens,
                     "terminal tool called"
                 );
                 return Ok(AgentResult {
@@ -260,7 +298,9 @@ pub async fn run_agent(
                     tool_calls: total_tool_calls,
                     subagents_spawned: config.subagent_counter.load(Ordering::Relaxed)
                         - initial_subagent_count,
+                    total_input_tokens,
                     total_output_tokens,
+                    total_tokens,
                 });
             }
 
@@ -293,8 +333,12 @@ pub async fn run_agent(
             info!(
                 agent = %config.name,
                 turn,
-                output_tokens = response.output_tokens,
+                input_tokens = response.usage.input_tokens,
+                output_tokens = response.usage.output_tokens,
+                total_tokens = response.usage.total_tokens,
+                total_input_tokens,
                 total_output_tokens,
+                total_tokens_so_far = total_tokens,
                 response_len = text.len(),
                 "finished"
             );
@@ -304,7 +348,9 @@ pub async fn run_agent(
                 tool_calls: total_tool_calls,
                 subagents_spawned: config.subagent_counter.load(Ordering::Relaxed)
                     - initial_subagent_count,
+                total_input_tokens,
                 total_output_tokens,
+                total_tokens,
             });
         }
     }
@@ -396,6 +442,7 @@ async fn run_subagent(
         name: format!("{}/subagent-{subagent_id}", parent_config.name),
         model: parent_config.model.clone(),
         max_turns: parent_config.max_turns,
+        compact_threshold: parent_config.compact_threshold,
         system_prompt: subagent_system_prompt().to_string(),
         client: Arc::clone(&parent_config.client),
         depth: AgentDepth::Subagent {

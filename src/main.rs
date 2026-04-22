@@ -4,10 +4,12 @@ use std::path::{Path, PathBuf};
 use tracing_subscriber::EnvFilter;
 
 mod agent;
+mod compact;
 mod config;
 mod debate;
 mod gemini_proxy;
 mod llm;
+mod provider;
 mod pr;
 mod prompts;
 mod review;

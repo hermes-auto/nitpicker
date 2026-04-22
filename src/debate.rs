@@ -1,8 +1,12 @@
-use crate::config::{Config, ProviderType, ReviewerConfig};
+use crate::config::{Config, ReviewerConfig};
 use crate::agent::{
     AgentConfig, AgentDepth, AgentProgress, add_spawn_subagent_tool, run_agent,
 };
-use crate::llm::{Completion, LLMClient, LLMClientDyn, LLMProvider, WithRetryExt};
+use crate::llm::{Completion, LLMClientDyn};
+use crate::provider::{
+    aggregator_needs_gemini_oauth, build_aggregator_client, build_reviewer_client,
+    reviewer_needs_gemini_oauth,
+};
 pub use crate::prompts::DebateMode;
 use crate::tools::{Tool, all_tools};
 use eyre::Result;
@@ -21,6 +25,17 @@ use tracing::info;
 struct DebateVerdict {
     text: String,
     agree: bool,
+}
+
+struct DebateTurnRequest<'a> {
+    client: Arc<dyn LLMClientDyn>,
+    compact_threshold: Option<u64>,
+    model: &'a str,
+    system_prompt: &'a str,
+    initial_message: &'a str,
+    max_turns: usize,
+    work_dir: &'a Path,
+    progress: Option<Arc<dyn Fn(AgentProgress) + Send + Sync>>,
 }
 
 struct SubmitVerdictTool {
@@ -82,14 +97,8 @@ impl Tool for SubmitVerdictTool {
 }
 
 async fn run_debate_turn(
-    client: Arc<dyn LLMClientDyn>,
-    model: &str,
-    system_prompt: &str,
-    initial_message: &str,
-    max_turns: usize,
-    work_dir: &Path,
-    progress: Option<Arc<dyn Fn(AgentProgress) + Send + Sync>>,
-) -> Result<(DebateVerdict, usize, usize, usize, u64)> {
+    request: DebateTurnRequest<'_>,
+) -> Result<(DebateVerdict, usize, usize, usize, u64, u64, u64)> {
     let verdict_store: Arc<Mutex<Option<DebateVerdict>>> = Arc::new(Mutex::new(None));
     let submit_tool = Arc::new(SubmitVerdictTool {
         verdict: Arc::clone(&verdict_store),
@@ -100,20 +109,21 @@ async fn run_debate_turn(
     tools_map.insert("submit_verdict".to_string(), submit_tool as Arc<dyn Tool>);
     let subagent_counter = Arc::new(AtomicUsize::new(0));
     let config = AgentConfig {
-        name: format!("debate-{model}"),
-        model: model.to_string(),
-        max_turns,
-        system_prompt: system_prompt.to_string(),
-        client,
+        name: format!("debate-{}", request.model),
+        model: request.model.to_string(),
+        max_turns: request.max_turns,
+        compact_threshold: request.compact_threshold,
+        system_prompt: request.system_prompt.to_string(),
+        client: request.client,
         depth: AgentDepth::TopLevel,
         terminal_tools: vec!["submit_verdict".to_string()],
         empty_response_nudge: Some("Please proceed with your analysis and call submit_verdict when you are done.".to_string()),
         max_empty_responses: 3,
         subagent_counter,
-        progress,
+        progress: request.progress,
     };
 
-    let result = run_agent(config, initial_message, &tools_map, work_dir).await?;
+    let result = run_agent(config, request.initial_message, &tools_map, request.work_dir).await?;
     if let Some(verdict) = verdict_store
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -124,7 +134,9 @@ async fn run_debate_turn(
             result.turns,
             result.tool_calls,
             result.subagents_spawned,
+            result.total_input_tokens,
             result.total_output_tokens,
+            result.total_tokens,
         ));
     }
 
@@ -136,7 +148,9 @@ async fn run_debate_turn(
         result.turns,
         result.tool_calls,
         result.subagents_spawned,
+        result.total_input_tokens,
         result.total_output_tokens,
+        result.total_tokens,
     ))
 }
 
@@ -196,37 +210,16 @@ fn build_client(
     reviewer: &ReviewerConfig,
     gemini_proxy: Option<&crate::gemini_proxy::GeminiProxyClient>,
 ) -> Result<Arc<dyn LLMClientDyn>> {
-    if reviewer.provider.is_gemini() && reviewer.use_oauth() {
-        let proxy_url = gemini_proxy
-            .map(|p| p.base_url())
-            .ok_or_else(|| eyre::eyre!("Gemini OAuth requires proxy"))?;
-        return crate::llm::create_gemini_client_with_proxy(&proxy_url);
+    build_reviewer_client(reviewer, gemini_proxy)
+}
+
+fn compact_threshold(config: &Config, reviewer: &ReviewerConfig) -> Result<Option<u64>> {
+    if reviewer.compact_threshold == Some(0) {
+        eyre::bail!("reviewer {} compact_threshold must be greater than 0", reviewer.name);
     }
-    let provider = match &reviewer.provider {
-        ProviderType::Anthropic => LLMProvider::Anthropic,
-        ProviderType::Gemini => LLMProvider::Gemini,
-        ProviderType::AnthropicCompatible => LLMProvider::AnthropicCompatible {
-            base_url: reviewer
-                .base_url
-                .clone()
-                .ok_or_else(|| eyre::eyre!("base_url required for anthropic_compatible"))?,
-            api_key_env: reviewer
-                .api_key_env
-                .clone()
-                .ok_or_else(|| eyre::eyre!("api_key_env required for anthropic_compatible"))?,
-        },
-        ProviderType::OpenAiCompatible => LLMProvider::OpenAICompatible {
-            base_url: reviewer
-                .base_url
-                .clone()
-                .ok_or_else(|| eyre::eyre!("base_url required for openai_compatible"))?,
-            api_key_env: reviewer
-                .api_key_env
-                .clone()
-                .ok_or_else(|| eyre::eyre!("api_key_env required for openai_compatible"))?,
-        },
-    };
-    Ok(provider.client_from_env()?.with_retry().into_arc())
+    Ok(reviewer
+        .compact_threshold
+        .or(config.default_compact_threshold()?))
 }
 
 pub async fn run_debate(
@@ -250,8 +243,8 @@ pub async fn run_debate(
 
     let needs_oauth = [actor_cfg, critic_cfg]
         .iter()
-        .any(|r| r.provider.is_gemini() && r.use_oauth())
-        || (agg_cfg.provider.is_gemini() && agg_cfg.use_oauth());
+        .any(|reviewer| reviewer_needs_gemini_oauth(reviewer))
+        || aggregator_needs_gemini_oauth(agg_cfg);
     let gemini_proxy = if needs_oauth {
         info!("Starting Gemini proxy for OAuth authentication...");
         Some(crate::gemini_proxy::GeminiProxyClient::new().await?)
@@ -261,40 +254,11 @@ pub async fn run_debate(
 
     let actor_client = build_client(actor_cfg, gemini_proxy.as_ref())?;
     let critic_client = build_client(critic_cfg, gemini_proxy.as_ref())?;
+    let actor_compact_threshold = compact_threshold(config, actor_cfg)?;
+    let critic_compact_threshold = compact_threshold(config, critic_cfg)?;
 
-    let agg_client: Arc<dyn LLMClientDyn> = if agg_cfg.provider.is_gemini() && agg_cfg.use_oauth() {
-        let proxy_url = gemini_proxy
-            .as_ref()
-            .map(|p| p.base_url())
-            .ok_or_else(|| eyre::eyre!("Gemini OAuth requires proxy"))?;
-        crate::llm::create_gemini_client_with_proxy(&proxy_url)?
-    } else {
-        let provider = match &agg_cfg.provider {
-            ProviderType::Anthropic => LLMProvider::Anthropic,
-            ProviderType::Gemini => LLMProvider::Gemini,
-            ProviderType::AnthropicCompatible => LLMProvider::AnthropicCompatible {
-                base_url: agg_cfg
-                    .base_url
-                    .clone()
-                    .ok_or_else(|| eyre::eyre!("base_url required"))?,
-                api_key_env: agg_cfg
-                    .api_key_env
-                    .clone()
-                    .ok_or_else(|| eyre::eyre!("api_key_env required"))?,
-            },
-            ProviderType::OpenAiCompatible => LLMProvider::OpenAICompatible {
-                base_url: agg_cfg
-                    .base_url
-                    .clone()
-                    .ok_or_else(|| eyre::eyre!("base_url required"))?,
-                api_key_env: agg_cfg
-                    .api_key_env
-                    .clone()
-                    .ok_or_else(|| eyre::eyre!("api_key_env required"))?,
-            },
-        };
-        provider.client_from_env()?.with_retry().into_arc()
-    };
+    let agg_client: Arc<dyn LLMClientDyn> =
+        build_aggregator_client(agg_cfg, gemini_proxy.as_ref())?;
 
     let actor_role = mode.actor_role();
     let critic_role = mode.critic_role();
@@ -336,20 +300,29 @@ pub async fn run_debate(
                 progress.turns, progress.tool_calls, progress.subagents_spawned
             ));
         }) as Arc<dyn Fn(AgentProgress) + Send + Sync>);
-        let (verdict, turns, tool_calls, subagents_spawned, total_output_tokens) = run_debate_turn(
-            Arc::clone(&actor_client),
-            &actor_cfg.model,
-            &actor_system,
-            &msg,
+        let (
+            verdict,
+            turns,
+            tool_calls,
+            subagents_spawned,
+            total_input_tokens,
+            total_output_tokens,
+            total_tokens,
+        ) = run_debate_turn(DebateTurnRequest {
+            client: Arc::clone(&actor_client),
+            compact_threshold: actor_compact_threshold,
+            model: &actor_cfg.model,
+            system_prompt: &actor_system,
+            initial_message: &msg,
             max_turns,
-            repo,
-            actor_progress,
-        )
+            work_dir: repo,
+            progress: actor_progress,
+        })
         .await?;
         let elapsed = start.elapsed().as_secs();
         pb.set_style(done_style.clone());
         pb.finish_with_message(format!(
-            "✓ round {round} ({turns} turns, {tool_calls} tool calls, {subagents_spawned} subagents, {total_output_tokens} output tokens, {elapsed}s)"
+            "✓ round {round} ({turns} turns, {tool_calls} tool calls, {subagents_spawned} subagents, {total_input_tokens} in, {total_output_tokens} out, {total_tokens} total tokens, {elapsed}s)"
         ));
         println!();
         skin.print_text(&verdict.text);
@@ -368,20 +341,29 @@ pub async fn run_debate(
                 progress.turns, progress.tool_calls, progress.subagents_spawned
             ));
         }) as Arc<dyn Fn(AgentProgress) + Send + Sync>);
-        let (verdict, turns, tool_calls, subagents_spawned, total_output_tokens) = run_debate_turn(
-            Arc::clone(&critic_client),
-            &critic_cfg.model,
-            &critic_system,
-            &msg,
+        let (
+            verdict,
+            turns,
+            tool_calls,
+            subagents_spawned,
+            total_input_tokens,
+            total_output_tokens,
+            total_tokens,
+        ) = run_debate_turn(DebateTurnRequest {
+            client: Arc::clone(&critic_client),
+            compact_threshold: critic_compact_threshold,
+            model: &critic_cfg.model,
+            system_prompt: &critic_system,
+            initial_message: &msg,
             max_turns,
-            repo,
-            critic_progress,
-        )
+            work_dir: repo,
+            progress: critic_progress,
+        })
         .await?;
         let elapsed = start.elapsed().as_secs();
         pb.set_style(done_style.clone());
         pb.finish_with_message(format!(
-            "✓ round {round} ({turns} turns, {tool_calls} tool calls, {subagents_spawned} subagents, {total_output_tokens} output tokens, {elapsed}s)"
+            "✓ round {round} ({turns} turns, {tool_calls} tool calls, {subagents_spawned} subagents, {total_input_tokens} in, {total_output_tokens} out, {total_tokens} total tokens, {elapsed}s)"
         ));
         println!();
         skin.print_text(&verdict.text);
