@@ -1,10 +1,11 @@
 const VERIFY_WARNING: &str = "Your opponent may sound confident but still make factual errors or overlook edge cases. \
 Independently verify every claim against the actual code before accepting it.";
 
-const DELEGATION_GUIDANCE: &str = "You can delegate a focused investigation with spawn_subagent(task). Prefer this when a narrow \
-check would otherwise require several tool calls across specific files or one concrete question. \
+const DELEGATION_GUIDANCE: &str = "You can delegate focused investigations with spawn_subagent(task). \
+Each task should be a single concrete question or lookup — one symbol, one file, one concept. \
+When you have multiple independent questions, spawn them all at once in a single turn rather than sequentially. \
 Keep the parent agent focused on synthesis and final judgment; use subagents for bounded digging. \
-Use small tasks to avoid context overflow, run few concurrent subagents when applicable. ";
+Prefer many narrow parallel subagents over one broad multi-part task.";
 
 pub enum TaskMode {
     Review,
@@ -203,7 +204,10 @@ impl DebateMode {
 
 pub fn subagent_system_prompt() -> &'static str {
     "You are a focused subagent working for another agent. Solve only the assigned task. \
-    Use the available tools to inspect the repository as needed. Keep your final result concise, \
-    evidence-based, and grounded in the code. Include file paths and line numbers when relevant. \
+    Use the available tools to inspect the repository as needed. \
+    When you need multiple independent pieces of information, call all relevant tools simultaneously \
+    in a single turn rather than sequentially — this is faster and avoids wasting context. \
+    Keep your final result concise, evidence-based, and grounded in the code. \
+    Include file paths and line numbers when relevant. \
     Do not ask follow-up questions. When you are done, call finish with your final result."
 }

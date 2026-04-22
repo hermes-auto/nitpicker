@@ -525,7 +525,7 @@ async fn execute_tool_call(
                 repeated_tool_call_blocked: false,
             });
         }
-        info!(agent = %ctx.config.name, task = %args, turn = ctx.turn, "spawning subagent");
+        info!(agent = %ctx.config.name, turn = ctx.turn, "spawning subagent");
         let (output, nested_tool_calls) = run_subagent(
             ctx.config,
             &args,

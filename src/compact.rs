@@ -84,7 +84,41 @@ fn split_thread(history: &[Message]) -> (Vec<Message>, Vec<Message>) {
 
 fn build_compaction_prompt(turn: usize, usage: TokenUsage, attempt: usize) -> String {
     format!(
-        "summarize the conversation so far to fit within a token budget. focus on durable user intent, constraints, decisions, discovered facts, tool outcomes, unresolved issues, and current execution status. omit verbose tool output and code unless it is essential. the result should be much shorter than the original conversation.\n\nReturn exactly one tagged block and nothing else:\n<summary>...</summary>\n\nThis compaction is happening before turn {turn}. Usage since the previous compaction: {} input, {} output, {} total tokens. This is attempt {attempt} of {COMPACTION_MAX_ATTEMPTS}; if the prior attempt missed the required tags, correct that here and return only the tagged summary block.",
+        "You are an expert software engineer summarizing a code exploration and review session \
+to free up context window space.\n\n\
+The most recent messages will be preserved verbatim after this summary. Your goal is \
+to capture the durable context from the older messages that is necessary to continue the \
+exploration/review without losing the plot.\n\
+Focus strictly on information vital for code analysis. Omit conversational filler, raw \
+search/tool outputs, and large blocks of code.\n\
+When constructing the summary, you MUST use the following exact markdown structure \
+inside the tags:\n\
+<summary>\n\
+## Review Goal\n\
+[1-2 sentences on the core objective of this code exploration/review. What are we \
+looking for?]\n\
+## Key Findings & Discoveries\n\
+- [List major architectural insights, design patterns discovered, or critical \
+issues/bugs identified so far.]\n\
+- [Keep these concise but highly technical.]\n\
+## Codebase Map (Relevant Files)\n\
+- [List the critical files and directories that have been identified as relevant \
+to the goal.]\n\
+- [Briefly note why they are relevant (e.g., `src/auth/token.rs`: handles JWT \
+validation and is where the bug likely resides).]\n\
+## Explored Territory\n\
+- [Briefly list what areas, files, or concepts have already been thoroughly \
+investigated so we do not repeat work.]\n\
+## Open Questions & Next Steps\n\
+- [List any unresolved anomalies, pending review items, constraints to remember, \
+or specific files that still need to be examined.]\n\
+</summary>\n\
+This compaction is happening before turn {turn}. Usage since the previous compaction: \
+{} input, {} output, {} total tokens.\n\
+CRITICAL: This is attempt {attempt} of {COMPACTION_MAX_ATTEMPTS}. Return EXACTLY ONE \
+tagged block starting with <summary> and ending with </summary>. Do not include any \
+text, pleasantries, or explanations outside of these tags. If a prior attempt failed, \
+ensure you output ONLY the XML tags this time.",
         usage.input_tokens, usage.output_tokens, usage.total_tokens
     )
 }
