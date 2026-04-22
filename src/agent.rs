@@ -151,6 +151,7 @@ pub async fn run_agent(
     let mut empty_response_count = 0usize;
     let mut last_tool_call_key: Option<String> = None;
     let mut consecutive_identical_tool_calls = 0usize;
+    let mut last_tool_call_outputs: HashMap<String, String> = HashMap::new();
     let initial_subagent_count = config.subagent_counter.load(Ordering::Relaxed);
 
     for turn in 0..config.max_turns {
@@ -160,7 +161,7 @@ pub async fn run_agent(
             preamble: Some(config.system_prompt.clone()),
             history: history[..history.len().saturating_sub(1)].to_vec(),
             tools: tool_definitions(&runtime_tools),
-            temperature: None,
+            temperature: Some(0.2),
             max_tokens: Some(8192),
             additional_params: None,
         };
@@ -183,7 +184,7 @@ pub async fn run_agent(
                 if last_tool_call_key.as_ref() == Some(&tool_call_key) {
                     consecutive_identical_tool_calls += 1;
                 } else {
-                    last_tool_call_key = Some(tool_call_key);
+                    last_tool_call_key = Some(tool_call_key.clone());
                     consecutive_identical_tool_calls = 1;
                 }
                 should_terminate |= config.terminal_tools.iter().any(|name| name == &tool_name);
@@ -204,6 +205,7 @@ pub async fn run_agent(
                     consecutive_identical_tool_calls,
                 )
                 .await?;
+                last_tool_call_outputs.insert(tool_call_key, output.clone());
                 total_tool_calls += nested_tool_calls;
                 report_progress(&config, turn + 1, total_tool_calls, initial_subagent_count);
                 let mut output = output;
@@ -427,8 +429,11 @@ async fn execute_tool_call(
             consecutive_identical_tool_calls,
             "blocking repeated identical tool call"
         );
-        return Err(eyre::eyre!(
-            "repeated identical tool call blocked for {tool_name} after {consecutive_identical_tool_calls} attempts"
+        return Ok((
+            format!(
+                "Warning: repeated identical tool call blocked for {tool_name} after {consecutive_identical_tool_calls} attempts. Think twice; try changing the arguments or using a different tool."
+            ),
+            0,
         ));
     }
 
@@ -440,18 +445,16 @@ async fn execute_tool_call(
             ));
         }
         info!(agent = %ctx.config.name, task = %args, turn = ctx.turn, "spawning subagent");
-        return Ok(
-            run_subagent(
-                ctx.config,
-                &args,
-                ctx.tools_map,
-                ctx.work_dir,
-                ctx.current_turns,
-                ctx.total_tool_calls,
-                ctx.initial_subagent_count,
-            )
-            .await,
-        );
+        return Ok(run_subagent(
+            ctx.config,
+            &args,
+            ctx.tools_map,
+            ctx.work_dir,
+            ctx.current_turns,
+            ctx.total_tool_calls,
+            ctx.initial_subagent_count,
+        )
+        .await);
     }
 
     match ctx.runtime_tools.get(tool_name) {
