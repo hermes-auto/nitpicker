@@ -98,7 +98,63 @@ pub enum FinishReason {
 pub struct CompletionResponse {
     pub choice: OneOrMany<AssistantContent>,
     pub finish_reason: FinishReason,
+    pub usage: TokenUsage,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
+pub struct TokenUsage {
+    pub input_tokens: u64,
     pub output_tokens: u64,
+    pub total_tokens: u64,
+}
+
+impl TokenUsage {
+    pub fn new(input_tokens: u64, output_tokens: u64) -> Self {
+        Self {
+            input_tokens,
+            output_tokens,
+            total_tokens: input_tokens.saturating_add(output_tokens),
+        }
+    }
+
+    pub fn record(&mut self, usage: TokenUsage) {
+        self.input_tokens = self.input_tokens.saturating_add(usage.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(usage.output_tokens);
+        self.total_tokens = self.total_tokens.saturating_add(usage.total_tokens);
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ConversationUsageWindow {
+    compact_threshold: Option<u64>,
+    usage: TokenUsage,
+}
+
+impl ConversationUsageWindow {
+    pub fn new(compact_threshold: Option<u64>) -> Self {
+        Self {
+            compact_threshold,
+            usage: TokenUsage::default(),
+        }
+    }
+
+    pub fn should_compact(&self) -> bool {
+        self.compact_threshold
+            .map(|threshold| self.usage.total_tokens >= threshold)
+            .unwrap_or(false)
+    }
+
+    pub fn usage(&self) -> TokenUsage {
+        self.usage
+    }
+
+    pub fn record(&mut self, usage: TokenUsage) {
+        self.usage.record(usage);
+    }
+
+    pub fn reset(&mut self) {
+        self.usage = TokenUsage::default();
+    }
 }
 
 impl CompletionResponse {
@@ -358,7 +414,7 @@ impl LLMClient for anthropic::Client {
         Ok(CompletionResponse {
             choice: response.choice,
             finish_reason,
-            output_tokens: response.usage.output_tokens,
+            usage: TokenUsage::new(response.usage.input_tokens, response.usage.output_tokens),
         })
     }
 }
@@ -389,7 +445,7 @@ impl LLMClient for gemini::Client {
         Ok(CompletionResponse {
             choice: response.choice,
             finish_reason,
-            output_tokens: response.usage.output_tokens,
+            usage: TokenUsage::new(response.usage.input_tokens, response.usage.output_tokens),
         })
     }
 }
@@ -422,7 +478,7 @@ impl LLMClient for openai::CompletionsClient {
         Ok(CompletionResponse {
             choice: response.choice,
             finish_reason,
-            output_tokens: response.usage.output_tokens,
+            usage: TokenUsage::new(response.usage.input_tokens, response.usage.output_tokens),
         })
     }
 }

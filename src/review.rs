@@ -1,8 +1,12 @@
 use crate::agent::{
     AgentConfig, AgentDepth, AgentProgress, add_spawn_subagent_tool, run_agent,
 };
-use crate::config::{Config, ProviderType, ReviewerConfig};
-use crate::llm::{Completion, FinishReason, LLMClient, LLMProvider, WithRetryExt};
+use crate::config::{Config, ReviewerConfig};
+use crate::llm::{Completion, FinishReason};
+use crate::provider::{
+    aggregator_needs_gemini_oauth, build_aggregator_client, build_reviewer_client,
+    reviewer_needs_gemini_oauth,
+};
 pub use crate::prompts::TaskMode;
 use crate::tools::{all_tools, floor_char_boundary, is_binary_file};
 use eyre::Result;
@@ -43,8 +47,8 @@ pub async fn run_review(
     let gemini_proxy = if config
         .reviewer
         .iter()
-        .any(|r| r.provider.is_gemini() && r.use_oauth())
-        || (config.aggregator.provider.is_gemini() && config.aggregator.use_oauth())
+        .any(reviewer_needs_gemini_oauth)
+        || aggregator_needs_gemini_oauth(&config.aggregator)
     {
         info!("Starting Gemini proxy for OAuth authentication...");
         Some(crate::gemini_proxy::GeminiProxyClient::new().await?)
@@ -57,15 +61,14 @@ pub async fn run_review(
         let repo = repo.to_path_buf();
         let name = reviewer.name.clone();
         let subagent_counter = Arc::new(AtomicUsize::new(0));
-        let agent_config =
-            build_agent_config(
-                reviewer,
-                system_prompt,
-                max_turns,
-                gemini_proxy.as_ref(),
-                Arc::clone(&subagent_counter),
-            )
-            .await;
+        let agent_config = build_agent_config(
+            config,
+            reviewer,
+            system_prompt,
+            max_turns,
+            gemini_proxy.as_ref(),
+            Arc::clone(&subagent_counter),
+        );
         info!(reviewer = %name, "spawning agent");
 
         let pb = mp.add(ProgressBar::new_spinner());
@@ -100,8 +103,13 @@ pub async fn run_review(
             pb.set_style(done);
             match &result {
                 Ok(r) => pb.finish_with_message(format!(
-                    "✓ done ({elapsed}s, {} turns, {} tool calls, {} subagents, {} output tokens)",
-                    r.turns, r.tool_calls, r.subagents_spawned, r.total_output_tokens
+                    "✓ done ({elapsed}s, {} turns, {} tool calls, {} subagents, {} in, {} out, {} total tokens)",
+                    r.turns,
+                    r.tool_calls,
+                    r.subagents_spawned,
+                    r.total_input_tokens,
+                    r.total_output_tokens,
+                    r.total_tokens
                 )),
                 Err(e) => pb.finish_with_message(format!("✗ failed: {e}")),
             }
@@ -138,7 +146,7 @@ pub async fn run_review(
     pb_agg.enable_steady_tick(Duration::from_millis(80));
 
     let agg = &config.aggregator;
-    let client = build_aggregator_client(agg, gemini_proxy.as_ref()).await?;
+    let client = build_aggregator_client(agg, gemini_proxy.as_ref())?;
     let completion = Completion {
         model: agg.model.clone(),
         prompt: Message::user(reduce_prompt),
@@ -232,37 +240,22 @@ async fn build_context(repo: &Path) -> String {
     context
 }
 
-async fn build_agent_config(
+fn build_agent_config(
+    config: &Config,
     reviewer: &ReviewerConfig,
     system_prompt: &str,
     max_turns: usize,
     gemini_proxy: Option<&crate::gemini_proxy::GeminiProxyClient>,
     subagent_counter: Arc<AtomicUsize>,
 ) -> Result<AgentConfig> {
-    let client: std::sync::Arc<dyn crate::llm::LLMClientDyn> =
-        if reviewer.provider.is_gemini() && reviewer.use_oauth() {
-            // Use OAuth via proxy
-            let proxy_url = gemini_proxy
-                .map(|p| p.base_url())
-                .ok_or_else(|| eyre::eyre!("Gemini proxy required for OAuth but not available"))?;
-            info!("Using Gemini OAuth via proxy at {}", proxy_url);
-            crate::llm::create_gemini_client_with_proxy(&proxy_url)?
-        } else {
-            // Use API key auth
-            provider_from_config(
-                &reviewer.provider,
-                reviewer.base_url.as_deref(),
-                reviewer.api_key_env.as_deref(),
-            )?
-            .client_from_env()?
-            .with_retry()
-            .into_arc()
-        };
+    let client = build_reviewer_client(reviewer, gemini_proxy)?;
+    let compact_threshold = config.reviewer_compact_threshold(reviewer)?;
 
     Ok(AgentConfig {
         name: reviewer.name.clone(),
         model: reviewer.model.clone(),
         max_turns,
+        compact_threshold,
         system_prompt: system_prompt.to_string(),
         client,
         depth: AgentDepth::TopLevel,
@@ -272,53 +265,4 @@ async fn build_agent_config(
         subagent_counter,
         progress: None,
     })
-}
-
-async fn build_aggregator_client(
-    agg: &crate::config::AggregatorConfig,
-    gemini_proxy: Option<&crate::gemini_proxy::GeminiProxyClient>,
-) -> Result<std::sync::Arc<dyn crate::llm::LLMClientDyn>> {
-    if agg.provider.is_gemini() && agg.use_oauth() {
-        // Use OAuth via proxy
-        let proxy_url = gemini_proxy
-            .map(|p| p.base_url())
-            .ok_or_else(|| eyre::eyre!("Gemini proxy required for OAuth but not available"))?;
-        info!("Using Gemini OAuth via proxy at {}", proxy_url);
-        Ok(crate::llm::create_gemini_client_with_proxy(&proxy_url)?)
-    } else {
-        // Use API key auth
-        Ok(provider_from_config(
-            &agg.provider,
-            agg.base_url.as_deref(),
-            agg.api_key_env.as_deref(),
-        )?
-        .client_from_env()?
-        .with_retry()
-        .into_arc())
-    }
-}
-
-fn provider_from_config(
-    provider: &ProviderType,
-    base_url: Option<&str>,
-    api_key_env: Option<&str>,
-) -> Result<LLMProvider> {
-    match provider {
-        ProviderType::Anthropic => Ok(LLMProvider::Anthropic),
-        ProviderType::Gemini => Ok(LLMProvider::Gemini),
-        ProviderType::AnthropicCompatible => Ok(LLMProvider::AnthropicCompatible {
-            base_url: require_field(base_url, "base_url", "anthropic_compatible")?,
-            api_key_env: require_field(api_key_env, "api_key_env", "anthropic_compatible")?,
-        }),
-        ProviderType::OpenAiCompatible => Ok(LLMProvider::OpenAICompatible {
-            base_url: require_field(base_url, "base_url", "openai_compatible")?,
-            api_key_env: require_field(api_key_env, "api_key_env", "openai_compatible")?,
-        }),
-    }
-}
-
-fn require_field(value: Option<&str>, field: &str, provider: &str) -> Result<String> {
-    value
-        .map(str::to_string)
-        .ok_or_else(|| eyre::eyre!("{provider} provider requires `{field}`"))
 }
