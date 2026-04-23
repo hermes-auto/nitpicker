@@ -71,9 +71,8 @@ fn build_compaction_prompt(turn: usize, usage: TokenUsage, attempt: usize) -> St
     format!(
         "You are an expert software engineer summarizing a code exploration and review session \
 to free up context window space.\n\n\
-The most recent messages will be preserved verbatim after this summary. Your goal is \
-to capture the durable context from the older messages that is necessary to continue the \
-exploration/review without losing the plot.\n\
+Your goal is to capture the full context needed to continue the exploration/review \
+seamlessly, including what was just being done.\n\
 Focus strictly on information vital for code analysis. Omit conversational filler, raw \
 search/tool outputs, and large blocks of code.\n\
 When constructing the summary, you MUST use the following exact markdown structure \
@@ -94,6 +93,9 @@ validation and is where the bug likely resides).]\n\
 ## Explored Territory\n\
 - [Briefly list what areas, files, or concepts have already been thoroughly \
 investigated so we do not repeat work.]\n\
+## Last Action & Immediate Context\n\
+- [Describe the most recent tool calls and their results. What was the agent trying \
+to find or verify? What did it just learn?]\n\
 ## Open Questions & Next Steps\n\
 - [List any unresolved anomalies, pending review items, constraints to remember, \
 or specific files that still need to be examined.]\n\
@@ -112,7 +114,7 @@ fn extract_tag(text: &str, tag: &str) -> Option<String> {
     let start_tag = format!("<{tag}>");
     let end_tag = format!("</{tag}>");
     let start = text.find(&start_tag)? + start_tag.len();
-    let end = text.rfind(&end_tag)?;
+    let end = start + text[start..].find(&end_tag)?;
     if end < start {
         return None;
     }

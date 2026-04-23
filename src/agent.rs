@@ -167,7 +167,6 @@ pub async fn run_agent(
     let mut total_tool_calls = 0usize;
     let mut empty_response_count = 0usize;
     let mut tool_call_history: VecDeque<String> = VecDeque::new();
-    let mut last_tool_call_outputs: HashMap<String, String> = HashMap::new();
     let initial_subagent_count = config.subagent_counter.load(Ordering::Relaxed);
     let mut boost_next_completion_temperature = false;
 
@@ -234,7 +233,7 @@ pub async fn run_agent(
                 let tool_name = call.function.name.clone();
                 let args = call.function.arguments.clone();
                 let tool_call_key = format!("{tool_name}:{args}");
-                tool_call_history.push_back(tool_call_key.clone());
+                tool_call_history.push_back(tool_call_key);
                 if tool_call_history.len() > TOOL_CALL_HISTORY_WINDOW {
                     tool_call_history.pop_front();
                 }
@@ -265,7 +264,6 @@ pub async fn run_agent(
                     nested_tool_calls,
                     repeated_tool_call_blocked: _,
                 } = outcome;
-                last_tool_call_outputs.insert(tool_call_key, output.clone());
                 total_tool_calls += nested_tool_calls;
                 report_progress(&config, turn + 1, total_tool_calls, initial_subagent_count);
                 let mut output = output;
