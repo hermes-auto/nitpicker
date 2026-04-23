@@ -333,6 +333,11 @@ fn build_analysis_prompt(path: Option<&Path>, custom_prompt: Option<&str>) -> St
     }
 }
 
+pub(crate) struct BaseBranch {
+    pub(crate) name: String,
+    pub(crate) revision: String,
+}
+
 pub fn detect_diff_context(repo: &Path) -> Result<String> {
     let branch = run_git(repo, &["rev-parse", "--abbrev-ref", "HEAD"])?;
     let branch = branch.trim();
@@ -348,17 +353,25 @@ pub fn detect_diff_context(repo: &Path) -> Result<String> {
         .trim()
         .is_empty();
 
-    let has_branch_commits = if branch != base {
-        !run_git(repo, &["log", &format!("{base}..HEAD"), "--oneline"])
-            .unwrap_or_default()
-            .trim()
-            .is_empty()
-    } else {
-        false
+    let has_branch_commits = match base.as_ref() {
+        Some(base) if branch != base.name => {
+            !run_git(repo, &["log", &format!("{}..HEAD", base.revision), "--oneline"])?
+                .trim()
+                .is_empty()
+        }
+        _ => false,
     };
 
     if !has_uncommitted && !has_branch_commits {
-        eyre::bail!("no changes to review: no uncommitted changes and no branch commits vs {base}");
+        if let Some(base) = base.as_ref() {
+            eyre::bail!(
+                "no changes to review: no uncommitted changes and no branch commits vs {}",
+                base.name
+            );
+        }
+        eyre::bail!(
+            "no changes to review: no uncommitted changes and no detectable base branch commits"
+        );
     }
 
     let mut parts = Vec::new();
@@ -366,8 +379,12 @@ pub fn detect_diff_context(repo: &Path) -> Result<String> {
         parts.push("- uncommitted changes (`git diff HEAD`)".to_string());
     }
     if has_branch_commits {
+        let base = base
+            .as_ref()
+            .ok_or_else(|| eyre::eyre!("base branch required when branch commits are present"))?;
         parts.push(format!(
-            "- commits on this branch vs {base} (`git log {base}..HEAD`, `git diff {base}...HEAD`)"
+            "- commits on this branch vs {} (`git log {}..HEAD`, `git diff {}...HEAD`)",
+            base.name, base.revision, base.revision
         ));
     }
 
@@ -377,7 +394,7 @@ pub fn detect_diff_context(repo: &Path) -> Result<String> {
     ))
 }
 
-fn detect_base_branch(repo: &Path) -> String {
+pub(crate) fn detect_base_branch(repo: &Path) -> Option<BaseBranch> {
     run_git(repo, &["symbolic-ref", "refs/remotes/origin/HEAD"])
         .ok()
         .and_then(|s| {
@@ -385,7 +402,32 @@ fn detect_base_branch(repo: &Path) -> String {
                 .strip_prefix("refs/remotes/origin/")
                 .map(str::to_string)
         })
-        .unwrap_or_else(|| "main".to_string())
+        .and_then(|branch| resolve_base_branch(repo, &branch))
+        .or_else(|| {
+            ["main", "master"]
+                .into_iter()
+                .find_map(|branch| resolve_base_branch(repo, branch))
+        })
+}
+
+fn resolve_base_branch(repo: &Path, branch: &str) -> Option<BaseBranch> {
+    let local = format!("refs/heads/{branch}");
+    if run_git(repo, &["rev-parse", "--verify", &local]).is_ok() {
+        return Some(BaseBranch {
+            name: branch.to_string(),
+            revision: branch.to_string(),
+        });
+    }
+
+    let remote = format!("refs/remotes/origin/{branch}");
+    if run_git(repo, &["rev-parse", "--verify", &remote]).is_ok() {
+        return Some(BaseBranch {
+            name: branch.to_string(),
+            revision: format!("origin/{branch}"),
+        });
+    }
+
+    None
 }
 
 fn run_git(repo: &Path, args: &[&str]) -> Result<String> {
