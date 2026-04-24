@@ -89,7 +89,7 @@ pub async fn fetch_with_retry(
 
         // Classify 429 responses
         let quota_context = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            match classify_quota_response_from_status(response.headers()).await {
+            match classify_quota_response_from_status(response.headers()) {
                 Ok(ctx) => Some(ctx),
                 Err(e) => {
                     warn!("Failed to classify quota response: {}", e);
@@ -127,7 +127,7 @@ pub async fn fetch_with_retry(
             return Ok(response);
         }
 
-        let delay_ms = resolve_retry_delay_ms(&response, attempt, quota_context.as_ref()).await;
+        let delay_ms = resolve_retry_delay_ms(&response, attempt, quota_context.as_ref());
         warn!(
             "Retry: attempt {} retrying status={} reason={} delay={}ms",
             attempt,
@@ -149,8 +149,8 @@ pub async fn fetch_with_retry(
         attempt += 1;
     }
 
-    // Fallback: should not reach here
-    Ok(request_builder.send().await?)
+    // Fallback: loop condition guarantees we never reach here, but compiler needs it.
+    unreachable!("retry loop should have returned within its body")
 }
 
 fn build_retry_throttle_key(url: &str, project: Option<&str>, model: Option<&str>) -> String {
@@ -160,13 +160,17 @@ fn build_retry_throttle_key(url: &str, project: Option<&str>, model: Option<&str
 async fn wait_for_retry_cooldown(cooldowns: &Arc<Mutex<HashMap<String, Instant>>>, key: &str) {
     let mut map = cooldowns.lock().await;
     if let Some(until) = map.get(key) {
-        let remaining = until.duration_since(Instant::now()).as_millis() as i64;
+        let remaining = until.saturating_duration_since(Instant::now()).as_millis() as i64;
         if remaining > 0 {
             drop(map);
             debug!("Retry: cooldown wait {}ms (key={})", remaining, short_key(key));
             tokio::time::sleep(Duration::from_millis(remaining as u64)).await;
             let mut map = cooldowns.lock().await;
-            map.remove(key);
+            if let Some(&current_until) = map.get(key) {
+                if current_until <= Instant::now() {
+                    map.remove(key);
+                }
+            }
         } else {
             map.remove(key);
         }
@@ -180,10 +184,7 @@ async fn set_retry_cooldown(
 ) {
     let next = Instant::now() + Duration::from_millis(delay_ms);
     let mut map = cooldowns.lock().await;
-    let current = map
-        .get(key)
-        .copied()
-        .unwrap_or_else(|| Instant::now() - Duration::from_secs(86400));
+    let current = map.get(key).copied().unwrap_or(Instant::now());
     map.insert(key.to_string(), std::cmp::max(current, next));
     debug!("Retry: cooldown set {}ms (key={})", delay_ms, short_key(key));
 }
@@ -214,7 +215,7 @@ fn get_exponential_delay_with_jitter(attempt: u32) -> u64 {
     capped + jitter
 }
 
-async fn resolve_retry_delay_ms(
+fn resolve_retry_delay_ms(
     response: &reqwest::Response,
     attempt: u32,
     quota_context: Option<&QuotaContext>,
@@ -240,7 +241,7 @@ async fn resolve_retry_delay_ms(
 
 /// Classify from headers + status when we can't consume the response body.
 /// Uses Retry-After header as a fallback for delay.
-pub async fn classify_quota_response_from_status(
+pub fn classify_quota_response_from_status(
     headers: &reqwest::header::HeaderMap,
 ) -> Result<QuotaContext> {
     // Try to extract retry delay from Retry-After header
@@ -260,9 +261,11 @@ pub async fn classify_quota_response_from_status(
 }
 
 fn short_key(key: &str) -> String {
-    if key.len() <= 120 {
-        key.to_string()
+    let mut chars = key.chars();
+    let truncated: String = chars.by_ref().take(120).collect();
+    if chars.next().is_some() {
+        format!("{}...", truncated)
     } else {
-        format!("{}...", &key[..120])
+        truncated
     }
 }
