@@ -227,7 +227,7 @@ Transcript saved to `{tempdir}/debate-{timestamp}.md` or `review-debate-{timesta
 This repo includes a manual GitHub Actions workflow at `.github/workflows/nitpicker-manual-dogfood.yml`.
 It is designed for safe dogfooding on this codebase:
 
-- runs in a Docker container (`rust:1.85-bookworm`)
+- runs in a Docker container (`rust:bookworm`)
 - builds nitpicker from the checked-out branch
 - writes a temporary OpenRouter config from workflow inputs + secrets
 - runs in stdout-first mode and uploads the report as an artifact
