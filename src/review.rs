@@ -64,7 +64,7 @@ pub async fn run_review(
         let agent_config = build_agent_config(
             config,
             reviewer,
-            system_prompt,
+            &system_prompt,
             max_turns,
             gemini_proxy.as_ref(),
             Arc::clone(&subagent_counter),
