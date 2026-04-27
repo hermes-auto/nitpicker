@@ -115,6 +115,8 @@ jobs:
             exit 1
           fi
 
+          git config --global --add safe.directory "$(pwd)"
+
           CMD=(nitpicker --repo . --config "$RUNNER_TEMP/nitpicker-openrouter.toml" --max-turns "$MAX_TURNS" --prompt "$REVIEW_PROMPT")
           if [ "$REVIEW_MODE" = "parallel" ]; then
             CMD+=(--no-debate)
@@ -124,7 +126,7 @@ jobs:
           printf ' %q' "${CMD[@]}"
           printf '\n'
 
-          "${CMD[@]}" | tee nitpicker-report.txt
+          "${CMD[@]}" 2>&1 | tee nitpicker-report.txt
 
       - name: Upload nitpicker artifact
         if: always()
